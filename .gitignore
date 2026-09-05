@@ -1,0 +1,7 @@
+input/
+output/
+backplay/
+/.DS_Store
+build/
+.cache/
+compile_commands.json
