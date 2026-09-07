@@ -21,6 +21,8 @@ namespace nplayer {
 
 // Column builders for one DBN schema. Collects records into an Arrow
 // RecordBatch: reserve(), then append() up to that many rows, then finish().
+// Appending past the reservation is undefined; the columns write straight
+// into reserved buffers without a capacity check.
 class batch_builder {
  public:
   virtual ~batch_builder() = default;
@@ -46,8 +48,9 @@ std::unique_ptr<batch_builder> make_batch_builder(dbn::schema schema, bool ts_ou
 
 // Writes DBN records of one schema to one Parquet file. append() fills a
 // batch on the calling thread; a full batch goes through a bounded SPSC queue
-// to a writer thread that encodes and compresses it, so decoding and Parquet
-// encoding overlap. close() must be called to finish the file; a writer that
+// to a writer thread, so decoding and Parquet encoding overlap. The writer
+// thread encodes and compresses the columns of a batch in parallel on Arrow's
+// CPU thread pool. close() must be called to finish the file; a writer that
 // is destroyed without close() leaves the file incomplete.
 //
 // Thread contract: append() and close() from one thread only.
@@ -68,6 +71,10 @@ class ParquetWriter {
   std::uint64_t close();
 
   std::uint64_t rows_skipped() const { return skipped_; }
+
+  // Rough peak memory of converting one file at `batch_rows`: the batch being
+  // built, the batches queued and encoding, and the decoder's buffers.
+  static std::uint64_t peak_memory(std::int64_t batch_rows);
 
  private:
   void flush();  // hands the open batch to the writer thread

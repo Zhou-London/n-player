@@ -248,7 +248,7 @@ struct options {
   std::filesystem::path output = "data/output"; // mirrors the input tree
   std::uint64_t limit = 0;         // records to convert per file; 0 converts all
   std::int64_t batch_rows = 1 << 20;  // rows per Arrow batch and Parquet row group
-  unsigned jobs = 1;               // files converted at the same time
+  unsigned jobs = 0;               // files converted at the same time; 0 picks from cores and memory
 };
 
 // Outcome of converting one file.

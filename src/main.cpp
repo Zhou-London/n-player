@@ -32,10 +32,11 @@ void add_convert(CLI::App& app, nplayer::options& opt, int& rc) {
       ->type_name("N")
       ->capture_default_str()
       ->check(CLI::Range(std::int64_t{1}, std::numeric_limits<std::int64_t>::max()));
-  cmd->add_option("-j,--jobs", opt.jobs, "Files converted at the same time")
+  cmd->add_option("-j,--jobs", opt.jobs,
+                  "Files converted at the same time; 0 picks a count from the CPU cores and "
+                  "the available memory")
       ->type_name("N")
-      ->capture_default_str()
-      ->check(CLI::Range(1u, std::numeric_limits<unsigned>::max()));
+      ->capture_default_str();
   cmd->callback([&] { rc = nplayer::convert_tree(opt) == 0 ? 0 : 1; });
 }
 

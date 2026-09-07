@@ -1,5 +1,6 @@
 #include "ParquetWriter.h"
 
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -7,8 +8,20 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/util/bit_util.h>
 #include <fmt/core.h>
 #include <parquet/properties.h>
+
+// Columns use the Iceberg primitive types int32, int64, and string only.
+// Iceberg has no unsigned or 8/16-bit integers, and its timestamp type holds
+// microseconds. DBN fields widen as follows:
+//
+//   u8, u16     -> int32
+//   u32         -> int64
+//   u64         -> int64, two's-complement reinterpretation
+//   timestamps  -> int64, Unix-epoch nanoseconds
+//
+// A reader recovers nanosecond timestamps with a plain cast.
 
 namespace nplayer {
 
@@ -18,6 +31,12 @@ using namespace std::chrono_literals;
 
 // Poll interval of the two queue ends when the queue is full or empty.
 constexpr auto queue_wait = 200us;
+
+// Finished batches the queue holds before append() blocks.
+constexpr std::size_t queue_depth = 4;
+
+// Column-buffer bytes per row of the widest schema, mbo.
+constexpr std::uint64_t row_bytes = 80;
 
 void check(const arrow::Status& st) {
   if (!st.ok()) throw std::runtime_error(st.ToString());
@@ -29,31 +48,130 @@ T unwrap(arrow::Result<T> result) {
   return std::move(result).ValueUnsafe();
 }
 
-std::shared_ptr<arrow::DataType> ts_ns() { return arrow::timestamp(arrow::TimeUnit::NANO, "UTC"); }
+// Column of `Builder` values written straight into the builder's reserved
+// buffer. reserve() takes the buffer pointer, set() stores one value, and
+// finish() advances the builder over the rows written. The pointer is valid
+// only between reserve() and finish(); every reserve() takes it again.
+template <typename Builder>
+class value_column {
+ public:
+  using value_type = typename Builder::value_type;
 
-// Appends a DBN timestamp; the undefined sentinel becomes null.
-void append_ts(arrow::TimestampBuilder& b, std::uint64_t ts) {
-  if (ts == dbn::undef_timestamp) {
-    b.UnsafeAppendNull();
-  } else {
-    b.UnsafeAppend(static_cast<std::int64_t>(ts));
+  arrow::Status reserve(std::int64_t n) {
+    ARROW_RETURN_NOT_OK(builder_.Reserve(n));
+    base_ = builder_.GetMutableValue(builder_.length());
+    return arrow::Status::OK();
   }
+
+  void set(std::int64_t i, value_type v) { base_[i] = v; }
+
+  arrow::Result<std::shared_ptr<arrow::Array>> finish(std::int64_t n) {
+    builder_.UnsafeAdvance(n);
+    base_ = nullptr;
+    return builder_.Finish();
+  }
+
+ private:
+  Builder builder_;
+  value_type* base_ = nullptr;
+};
+
+// value_column with a validity bitmap. The bitmap starts all valid; set()
+// clears a bit for a null, so the common valid case costs one store.
+template <typename Builder>
+class nullable_column {
+ public:
+  using value_type = typename Builder::value_type;
+
+  arrow::Status reserve(std::int64_t n) {
+    ARROW_RETURN_NOT_OK(builder_.Reserve(n));
+    base_ = builder_.GetMutableValue(builder_.length());
+    bitmap_.assign(static_cast<std::size_t>(arrow::bit_util::BytesForBits(n)), 0xFF);
+    nulls_ = 0;
+    return arrow::Status::OK();
+  }
+
+  void set(std::int64_t i, value_type v, bool valid) {
+    base_[i] = v;
+    if (!valid) [[unlikely]] {
+      arrow::bit_util::ClearBit(bitmap_.data(), i);
+      ++nulls_;
+    }
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Array>> finish(std::int64_t n) {
+    if (nulls_ == 0) {
+      builder_.UnsafeAdvance(n);
+    } else {
+      builder_.UnsafeAdvance(n, bitmap_.data(), 0);
+    }
+    base_ = nullptr;
+    return builder_.Finish();
+  }
+
+ private:
+  Builder builder_;
+  value_type* base_ = nullptr;
+  std::vector<std::uint8_t> bitmap_;
+  std::int64_t nulls_ = 0;
+};
+
+// One-character utf8 column for `action` and `side`. Every value is one
+// byte, so the offsets are 0, 1, 2, ... and one offsets buffer, built once,
+// serves every batch as a slice. The values buffer is the bytes themselves.
+class char_column {
+ public:
+  arrow::Status reserve(std::int64_t n) {
+    if (capacity_ < n) {
+      ARROW_ASSIGN_OR_RAISE(auto offsets, arrow::AllocateBuffer((n + 1) * kOffset));
+      auto* o = reinterpret_cast<std::int32_t*>(offsets->mutable_data());
+      for (std::int64_t i = 0; i <= n; ++i) o[i] = static_cast<std::int32_t>(i);
+      offsets_ = std::move(offsets);
+      capacity_ = n;
+    }
+    ARROW_ASSIGN_OR_RAISE(values_, arrow::AllocateBuffer(n));
+    base_ = values_->mutable_data();
+    return arrow::Status::OK();
+  }
+
+  void set(std::int64_t i, char c) { base_[i] = static_cast<std::uint8_t>(c); }
+
+  arrow::Result<std::shared_ptr<arrow::Array>> finish(std::int64_t n) {
+    auto data = arrow::ArrayData::Make(
+        arrow::utf8(), n,
+        {nullptr, arrow::SliceBuffer(offsets_, 0, (n + 1) * kOffset), std::move(values_)}, 0);
+    base_ = nullptr;
+    return arrow::MakeArray(data);
+  }
+
+ private:
+  static constexpr std::int64_t kOffset = sizeof(std::int32_t);
+  std::shared_ptr<arrow::Buffer> offsets_;
+  std::int64_t capacity_ = 0;
+  std::shared_ptr<arrow::Buffer> values_;
+  std::uint8_t* base_ = nullptr;
+};
+
+using ts_column = nullable_column<arrow::Int64Builder>;
+
+// Stores a DBN timestamp as Unix-epoch nanoseconds; the undefined sentinel
+// becomes null.
+void set_ts(ts_column& c, std::int64_t i, std::uint64_t ts) {
+  c.set(i, static_cast<std::int64_t>(ts), ts != dbn::undef_timestamp);
 }
 
-void append_price(arrow::Int64Builder& b, std::int64_t price) {
-  if (price == dbn::undef_price) {
-    b.UnsafeAppendNull();
-  } else {
-    b.UnsafeAppend(price);
-  }
+void set_price(nullable_column<arrow::Int64Builder>& c, std::int64_t i, std::int64_t price) {
+  c.set(i, price, price != dbn::undef_price);
 }
 
-void append_size(arrow::UInt32Builder& b, std::uint32_t size) {
-  if (size == dbn::undef_order_size) {
-    b.UnsafeAppendNull();
-  } else {
-    b.UnsafeAppend(size);
-  }
+void set_size(nullable_column<arrow::Int64Builder>& c, std::int64_t i, std::uint32_t size) {
+  c.set(i, static_cast<std::int64_t>(size), size != dbn::undef_order_size);
+}
+
+// Stores a u64 order id as int64. An id at or above 2^63 comes out negative.
+// A cast back to unsigned restores it. CME ids stay far below that.
+void set_order_id(value_column<arrow::Int64Builder>& c, std::int64_t i, std::uint64_t id) {
+  c.set(i, static_cast<std::int64_t>(id));
 }
 
 // Reads the record struct `T` from the front of a framed record, plus the
@@ -74,42 +192,42 @@ T load(std::span<const std::byte> record, bool ts_out, std::uint64_t& out_ts) {
 
 // Columns shared by every record type, in Databento's DataFrame order.
 struct header_columns {
-  arrow::TimestampBuilder ts_recv{ts_ns(), arrow::default_memory_pool()};
-  arrow::TimestampBuilder ts_event{ts_ns(), arrow::default_memory_pool()};
-  arrow::UInt8Builder rtype;
-  arrow::UInt16Builder publisher_id;
-  arrow::UInt32Builder instrument_id;
+  ts_column ts_recv;
+  ts_column ts_event;
+  value_column<arrow::Int32Builder> rtype;
+  value_column<arrow::Int32Builder> publisher_id;
+  value_column<arrow::Int64Builder> instrument_id;
 
   static void fields(std::vector<std::shared_ptr<arrow::Field>>& f) {
-    f.push_back(arrow::field("ts_recv", ts_ns()));
-    f.push_back(arrow::field("ts_event", ts_ns()));
-    f.push_back(arrow::field("rtype", arrow::uint8(), false));
-    f.push_back(arrow::field("publisher_id", arrow::uint16(), false));
-    f.push_back(arrow::field("instrument_id", arrow::uint32(), false));
+    f.push_back(arrow::field("ts_recv", arrow::int64()));
+    f.push_back(arrow::field("ts_event", arrow::int64()));
+    f.push_back(arrow::field("rtype", arrow::int32(), false));
+    f.push_back(arrow::field("publisher_id", arrow::int32(), false));
+    f.push_back(arrow::field("instrument_id", arrow::int64(), false));
   }
 
   arrow::Status reserve(std::int64_t n) {
-    ARROW_RETURN_NOT_OK(ts_recv.Reserve(n));
-    ARROW_RETURN_NOT_OK(ts_event.Reserve(n));
-    ARROW_RETURN_NOT_OK(rtype.Reserve(n));
-    ARROW_RETURN_NOT_OK(publisher_id.Reserve(n));
-    return instrument_id.Reserve(n);
+    ARROW_RETURN_NOT_OK(ts_recv.reserve(n));
+    ARROW_RETURN_NOT_OK(ts_event.reserve(n));
+    ARROW_RETURN_NOT_OK(rtype.reserve(n));
+    ARROW_RETURN_NOT_OK(publisher_id.reserve(n));
+    return instrument_id.reserve(n);
   }
 
-  void append(const dbn::record_header& hd, std::uint64_t recv) {
-    append_ts(ts_recv, recv);
-    append_ts(ts_event, hd.ts_event);
-    rtype.UnsafeAppend(hd.rtype);
-    publisher_id.UnsafeAppend(hd.publisher_id);
-    instrument_id.UnsafeAppend(hd.instrument_id);
+  void set(std::int64_t i, const dbn::record_header& hd, std::uint64_t recv) {
+    set_ts(ts_recv, i, recv);
+    set_ts(ts_event, i, hd.ts_event);
+    rtype.set(i, hd.rtype);
+    publisher_id.set(i, hd.publisher_id);
+    instrument_id.set(i, hd.instrument_id);
   }
 
-  arrow::Status finish(std::vector<std::shared_ptr<arrow::Array>>& out) {
-    ARROW_ASSIGN_OR_RAISE(auto a0, ts_recv.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto a1, ts_event.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto a2, rtype.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto a3, publisher_id.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto a4, instrument_id.Finish());
+  arrow::Status finish(std::int64_t n, std::vector<std::shared_ptr<arrow::Array>>& out) {
+    ARROW_ASSIGN_OR_RAISE(auto a0, ts_recv.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto a1, ts_event.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto a2, rtype.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto a3, publisher_id.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto a4, instrument_id.finish(n));
     out.insert(out.end(), {a0, a1, a2, a3, a4});
     return arrow::Status::OK();
   }
@@ -118,55 +236,41 @@ struct header_columns {
 // Trailing columns every book record ends with, plus the optional ts_out.
 struct tail_columns {
   bool ts_out;
-  arrow::Int32Builder ts_in_delta;
-  arrow::UInt32Builder sequence;
-  arrow::TimestampBuilder ts_out_col{ts_ns(), arrow::default_memory_pool()};
+  value_column<arrow::Int32Builder> ts_in_delta;
+  value_column<arrow::Int64Builder> sequence;
+  ts_column ts_out_col;
 
   explicit tail_columns(bool with_ts_out) : ts_out(with_ts_out) {}
 
   void fields(std::vector<std::shared_ptr<arrow::Field>>& f) const {
     f.push_back(arrow::field("ts_in_delta", arrow::int32(), false));
-    f.push_back(arrow::field("sequence", arrow::uint32(), false));
-    if (ts_out) f.push_back(arrow::field("ts_out", ts_ns()));
+    f.push_back(arrow::field("sequence", arrow::int64(), false));
+    if (ts_out) f.push_back(arrow::field("ts_out", arrow::int64()));
   }
 
   arrow::Status reserve(std::int64_t n) {
-    ARROW_RETURN_NOT_OK(ts_in_delta.Reserve(n));
-    ARROW_RETURN_NOT_OK(sequence.Reserve(n));
-    if (ts_out) ARROW_RETURN_NOT_OK(ts_out_col.Reserve(n));
+    ARROW_RETURN_NOT_OK(ts_in_delta.reserve(n));
+    ARROW_RETURN_NOT_OK(sequence.reserve(n));
+    if (ts_out) ARROW_RETURN_NOT_OK(ts_out_col.reserve(n));
     return arrow::Status::OK();
   }
 
-  void append(std::int32_t delta, std::uint32_t seq, std::uint64_t out_ts) {
-    ts_in_delta.UnsafeAppend(delta);
-    sequence.UnsafeAppend(seq);
-    if (ts_out) append_ts(ts_out_col, out_ts);
+  void set(std::int64_t i, std::int32_t delta, std::uint32_t seq, std::uint64_t out_ts) {
+    ts_in_delta.set(i, delta);
+    sequence.set(i, static_cast<std::int64_t>(seq));
+    if (ts_out) set_ts(ts_out_col, i, out_ts);
   }
 
-  arrow::Status finish(std::vector<std::shared_ptr<arrow::Array>>& out) {
-    ARROW_ASSIGN_OR_RAISE(auto a0, ts_in_delta.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto a1, sequence.Finish());
+  arrow::Status finish(std::int64_t n, std::vector<std::shared_ptr<arrow::Array>>& out) {
+    ARROW_ASSIGN_OR_RAISE(auto a0, ts_in_delta.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto a1, sequence.finish(n));
     out.insert(out.end(), {a0, a1});
     if (ts_out) {
-      ARROW_ASSIGN_OR_RAISE(auto a2, ts_out_col.Finish());
+      ARROW_ASSIGN_OR_RAISE(auto a2, ts_out_col.finish(n));
       out.push_back(a2);
     }
     return arrow::Status::OK();
   }
-};
-
-// One-character string column for `action` and `side`.
-class char_column {
- public:
-  arrow::Status reserve(std::int64_t n) {
-    ARROW_RETURN_NOT_OK(b_.Reserve(n));
-    return b_.ReserveData(n);
-  }
-  void append(char c) { b_.UnsafeAppend(&c, 1); }
-  arrow::Result<std::shared_ptr<arrow::Array>> finish() { return b_.Finish(); }
-
- private:
-  arrow::StringBuilder b_;
 };
 
 class mbo_builder final : public batch_builder {
@@ -177,10 +281,10 @@ class mbo_builder final : public batch_builder {
     f.push_back(arrow::field("action", arrow::utf8(), false));
     f.push_back(arrow::field("side", arrow::utf8(), false));
     f.push_back(arrow::field("price", arrow::int64()));
-    f.push_back(arrow::field("size", arrow::uint32()));
-    f.push_back(arrow::field("channel_id", arrow::uint8(), false));
-    f.push_back(arrow::field("order_id", arrow::uint64(), false));
-    f.push_back(arrow::field("flags", arrow::uint8(), false));
+    f.push_back(arrow::field("size", arrow::int64()));
+    f.push_back(arrow::field("channel_id", arrow::int32(), false));
+    f.push_back(arrow::field("order_id", arrow::int64(), false));
+    f.push_back(arrow::field("flags", arrow::int32(), false));
     tail_.fields(f);
     schema_ = arrow::schema(std::move(f));
   }
@@ -191,27 +295,31 @@ class mbo_builder final : public batch_builder {
     ARROW_RETURN_NOT_OK(hd_.reserve(n));
     ARROW_RETURN_NOT_OK(action_.reserve(n));
     ARROW_RETURN_NOT_OK(side_.reserve(n));
-    ARROW_RETURN_NOT_OK(price_.Reserve(n));
-    ARROW_RETURN_NOT_OK(size_.Reserve(n));
-    ARROW_RETURN_NOT_OK(channel_id_.Reserve(n));
-    ARROW_RETURN_NOT_OK(order_id_.Reserve(n));
-    ARROW_RETURN_NOT_OK(flags_.Reserve(n));
-    return tail_.reserve(n);
+    ARROW_RETURN_NOT_OK(price_.reserve(n));
+    ARROW_RETURN_NOT_OK(size_.reserve(n));
+    ARROW_RETURN_NOT_OK(channel_id_.reserve(n));
+    ARROW_RETURN_NOT_OK(order_id_.reserve(n));
+    ARROW_RETURN_NOT_OK(flags_.reserve(n));
+    ARROW_RETURN_NOT_OK(tail_.reserve(n));
+    capacity_ = n;
+    return arrow::Status::OK();
   }
 
   bool append(std::span<const std::byte> record) override {
     if (std::to_integer<std::uint8_t>(record[1]) != dbn::rtype::mbo) return false;
+    assert(rows_ < capacity_);
     std::uint64_t out_ts = dbn::undef_timestamp;
     const auto m = load<dbn::mbo_msg>(record, tail_.ts_out, out_ts);
-    hd_.append(m.hd, m.ts_recv);
-    action_.append(m.action);
-    side_.append(m.side);
-    append_price(price_, m.price);
-    append_size(size_, m.size);
-    channel_id_.UnsafeAppend(m.channel_id);
-    order_id_.UnsafeAppend(m.order_id);
-    flags_.UnsafeAppend(m.flags);
-    tail_.append(m.ts_in_delta, m.sequence, out_ts);
+    const std::int64_t i = rows_;
+    hd_.set(i, m.hd, m.ts_recv);
+    action_.set(i, m.action);
+    side_.set(i, m.side);
+    set_price(price_, i, m.price);
+    set_size(size_, i, m.size);
+    channel_id_.set(i, m.channel_id);
+    set_order_id(order_id_, i, m.order_id);
+    flags_.set(i, m.flags);
+    tail_.set(i, m.ts_in_delta, m.sequence, out_ts);
     ++rows_;
     return true;
   }
@@ -219,20 +327,21 @@ class mbo_builder final : public batch_builder {
   std::int64_t rows() const override { return rows_; }
 
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> finish() override {
+    const std::int64_t n = rows_;
     std::vector<std::shared_ptr<arrow::Array>> a;
-    ARROW_RETURN_NOT_OK(hd_.finish(a));
-    ARROW_ASSIGN_OR_RAISE(auto action, action_.finish());
-    ARROW_ASSIGN_OR_RAISE(auto side, side_.finish());
-    ARROW_ASSIGN_OR_RAISE(auto price, price_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto size, size_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto channel_id, channel_id_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto order_id, order_id_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto flags, flags_.Finish());
+    ARROW_RETURN_NOT_OK(hd_.finish(n, a));
+    ARROW_ASSIGN_OR_RAISE(auto action, action_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto side, side_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto price, price_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto size, size_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto channel_id, channel_id_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto order_id, order_id_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto flags, flags_.finish(n));
     a.insert(a.end(), {action, side, price, size, channel_id, order_id, flags});
-    ARROW_RETURN_NOT_OK(tail_.finish(a));
-    auto batch = arrow::RecordBatch::Make(schema_, rows_, std::move(a));
+    ARROW_RETURN_NOT_OK(tail_.finish(n, a));
     rows_ = 0;
-    return batch;
+    capacity_ = 0;
+    return arrow::RecordBatch::Make(schema_, n, std::move(a));
   }
 
  private:
@@ -240,13 +349,14 @@ class mbo_builder final : public batch_builder {
   header_columns hd_;
   char_column action_;
   char_column side_;
-  arrow::Int64Builder price_;
-  arrow::UInt32Builder size_;
-  arrow::UInt8Builder channel_id_;
-  arrow::UInt64Builder order_id_;
-  arrow::UInt8Builder flags_;
+  nullable_column<arrow::Int64Builder> price_;
+  nullable_column<arrow::Int64Builder> size_;
+  value_column<arrow::Int32Builder> channel_id_;
+  value_column<arrow::Int64Builder> order_id_;
+  value_column<arrow::Int32Builder> flags_;
   tail_columns tail_;
   std::int64_t rows_ = 0;
+  std::int64_t capacity_ = 0;
 };
 
 class trades_builder final : public batch_builder {
@@ -256,10 +366,10 @@ class trades_builder final : public batch_builder {
     header_columns::fields(f);
     f.push_back(arrow::field("action", arrow::utf8(), false));
     f.push_back(arrow::field("side", arrow::utf8(), false));
-    f.push_back(arrow::field("depth", arrow::uint8(), false));
+    f.push_back(arrow::field("depth", arrow::int32(), false));
     f.push_back(arrow::field("price", arrow::int64()));
-    f.push_back(arrow::field("size", arrow::uint32()));
-    f.push_back(arrow::field("flags", arrow::uint8(), false));
+    f.push_back(arrow::field("size", arrow::int64()));
+    f.push_back(arrow::field("flags", arrow::int32(), false));
     tail_.fields(f);
     schema_ = arrow::schema(std::move(f));
   }
@@ -270,25 +380,29 @@ class trades_builder final : public batch_builder {
     ARROW_RETURN_NOT_OK(hd_.reserve(n));
     ARROW_RETURN_NOT_OK(action_.reserve(n));
     ARROW_RETURN_NOT_OK(side_.reserve(n));
-    ARROW_RETURN_NOT_OK(depth_.Reserve(n));
-    ARROW_RETURN_NOT_OK(price_.Reserve(n));
-    ARROW_RETURN_NOT_OK(size_.Reserve(n));
-    ARROW_RETURN_NOT_OK(flags_.Reserve(n));
-    return tail_.reserve(n);
+    ARROW_RETURN_NOT_OK(depth_.reserve(n));
+    ARROW_RETURN_NOT_OK(price_.reserve(n));
+    ARROW_RETURN_NOT_OK(size_.reserve(n));
+    ARROW_RETURN_NOT_OK(flags_.reserve(n));
+    ARROW_RETURN_NOT_OK(tail_.reserve(n));
+    capacity_ = n;
+    return arrow::Status::OK();
   }
 
   bool append(std::span<const std::byte> record) override {
     if (std::to_integer<std::uint8_t>(record[1]) != dbn::rtype::mbp_0) return false;
+    assert(rows_ < capacity_);
     std::uint64_t out_ts = dbn::undef_timestamp;
     const auto m = load<dbn::trade_msg>(record, tail_.ts_out, out_ts);
-    hd_.append(m.hd, m.ts_recv);
-    action_.append(m.action);
-    side_.append(m.side);
-    depth_.UnsafeAppend(m.depth);
-    append_price(price_, m.price);
-    append_size(size_, m.size);
-    flags_.UnsafeAppend(m.flags);
-    tail_.append(m.ts_in_delta, m.sequence, out_ts);
+    const std::int64_t i = rows_;
+    hd_.set(i, m.hd, m.ts_recv);
+    action_.set(i, m.action);
+    side_.set(i, m.side);
+    depth_.set(i, m.depth);
+    set_price(price_, i, m.price);
+    set_size(size_, i, m.size);
+    flags_.set(i, m.flags);
+    tail_.set(i, m.ts_in_delta, m.sequence, out_ts);
     ++rows_;
     return true;
   }
@@ -296,19 +410,20 @@ class trades_builder final : public batch_builder {
   std::int64_t rows() const override { return rows_; }
 
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> finish() override {
+    const std::int64_t n = rows_;
     std::vector<std::shared_ptr<arrow::Array>> a;
-    ARROW_RETURN_NOT_OK(hd_.finish(a));
-    ARROW_ASSIGN_OR_RAISE(auto action, action_.finish());
-    ARROW_ASSIGN_OR_RAISE(auto side, side_.finish());
-    ARROW_ASSIGN_OR_RAISE(auto depth, depth_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto price, price_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto size, size_.Finish());
-    ARROW_ASSIGN_OR_RAISE(auto flags, flags_.Finish());
+    ARROW_RETURN_NOT_OK(hd_.finish(n, a));
+    ARROW_ASSIGN_OR_RAISE(auto action, action_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto side, side_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto depth, depth_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto price, price_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto size, size_.finish(n));
+    ARROW_ASSIGN_OR_RAISE(auto flags, flags_.finish(n));
     a.insert(a.end(), {action, side, depth, price, size, flags});
-    ARROW_RETURN_NOT_OK(tail_.finish(a));
-    auto batch = arrow::RecordBatch::Make(schema_, rows_, std::move(a));
+    ARROW_RETURN_NOT_OK(tail_.finish(n, a));
     rows_ = 0;
-    return batch;
+    capacity_ = 0;
+    return arrow::RecordBatch::Make(schema_, n, std::move(a));
   }
 
  private:
@@ -316,12 +431,13 @@ class trades_builder final : public batch_builder {
   header_columns hd_;
   char_column action_;
   char_column side_;
-  arrow::UInt8Builder depth_;
-  arrow::Int64Builder price_;
-  arrow::UInt32Builder size_;
-  arrow::UInt8Builder flags_;
+  value_column<arrow::Int32Builder> depth_;
+  nullable_column<arrow::Int64Builder> price_;
+  nullable_column<arrow::Int64Builder> size_;
+  value_column<arrow::Int32Builder> flags_;
   tail_columns tail_;
   std::int64_t rows_ = 0;
+  std::int64_t capacity_ = 0;
 };
 
 // File-level key-value metadata: the DBN header, so a reader can tell what
@@ -346,7 +462,8 @@ std::shared_ptr<arrow::KeyValueMetadata> file_metadata(const dbn::metadata& md) 
   }
   std::vector<std::string> keys{"dbn.version", "dbn.dataset", "dbn.schema", "dbn.start",
                                 "dbn.end",     "dbn.stype_in", "dbn.stype_out", "dbn.symbols",
-                                "dbn.partial", "dbn.not_found", "dbn.mappings", "price_scale"};
+                                "dbn.partial", "dbn.not_found", "dbn.mappings", "price_scale",
+                                "timestamp_unit"};
   std::vector<std::string> values{
       std::to_string(md.version),
       md.dataset,
@@ -359,7 +476,8 @@ std::shared_ptr<arrow::KeyValueMetadata> file_metadata(const dbn::metadata& md) 
       join(md.partial),
       join(md.not_found),
       mappings,
-      std::to_string(dbn::price_scale)};
+      std::to_string(dbn::price_scale),
+      "ns"};
   return arrow::KeyValueMetadata::Make(std::move(keys), std::move(values));
 }
 
@@ -380,6 +498,13 @@ std::shared_ptr<parquet::WriterProperties> writer_properties(std::int64_t batch_
 
 }  // namespace
 
+std::uint64_t ParquetWriter::peak_memory(std::int64_t batch_rows) {
+  // One batch under construction, queue_depth waiting, one being encoded;
+  // then the zstd window, the file buffers, and the Parquet page buffers.
+  return static_cast<std::uint64_t>(batch_rows) * row_bytes * (queue_depth + 2) +
+         (std::uint64_t{64} << 20);
+}
+
 std::unique_ptr<batch_builder> make_batch_builder(dbn::schema schema, bool ts_out) {
   switch (schema) {
     case dbn::schema::mbo: return std::make_unique<mbo_builder>(ts_out);
@@ -397,11 +522,14 @@ ParquetWriter::ParquetWriter(const std::filesystem::path& path, const dbn::metad
                              std::int64_t batch_rows)
     : batch_rows_(batch_rows),
       builder_(make_batch_builder(md.schema.value(), md.ts_out)),
-      queue_(4) {
+      queue_(queue_depth) {
   if (batch_rows <= 0) throw std::runtime_error("batch_rows must be positive");
   sink_ = unwrap(arrow::io::FileOutputStream::Open(path.string()));
   const auto schema = builder_->schema()->WithMetadata(file_metadata(md));
-  auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
+  // use_threads encodes the columns of a batch in parallel on Arrow's CPU
+  // thread pool, which every ParquetWriter in the process shares.
+  auto arrow_props =
+      parquet::ArrowWriterProperties::Builder().store_schema()->set_use_threads(true)->build();
   writer_ = unwrap(parquet::arrow::FileWriter::Open(*schema, arrow::default_memory_pool(), sink_,
                                                     writer_properties(batch_rows), arrow_props));
   check(builder_->reserve(batch_rows_));

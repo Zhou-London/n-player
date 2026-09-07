@@ -4,7 +4,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -53,6 +56,69 @@ class cursor {
   std::span<const std::byte> data_;
   std::size_t pos_ = 0;
 };
+
+// Reads the number at the front of a one-line file such as a cgroup limit.
+// Returns nullopt for a missing file or a non-numeric value like "max".
+std::optional<std::uint64_t> file_number(const char* path) {
+  std::ifstream in(path);
+  std::uint64_t value;
+  if (in >> value) return value;
+  return std::nullopt;
+}
+
+// Reads a kB field of /proc/meminfo by its key, in bytes.
+std::optional<std::uint64_t> meminfo_bytes(const std::string& key) {
+  std::ifstream in("/proc/meminfo");
+  std::string name;
+  std::uint64_t kb;
+  while (in >> name >> kb) {
+    if (name == key + ":") return kb * 1024;
+    in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  }
+  return std::nullopt;
+}
+
+// Memory this process can still take: MemAvailable, capped by the cgroup
+// limit minus the cgroup's current usage when a limit is set. Nullopt when
+// neither source is readable.
+std::optional<std::uint64_t> available_memory() {
+  std::optional<std::uint64_t> avail = meminfo_bytes("MemAvailable");
+  struct cgroup_files {
+    const char* limit;
+    const char* usage;
+  };
+  constexpr cgroup_files cgroups[] = {
+      {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"},  // v2
+      {"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+       "/sys/fs/cgroup/memory/memory.usage_in_bytes"},  // v1
+  };
+  for (const auto& cg : cgroups) {
+    const auto limit = file_number(cg.limit);
+    if (!limit) continue;
+    const std::uint64_t usage = file_number(cg.usage).value_or(0);
+    const std::uint64_t left = *limit > usage ? *limit - usage : 0;
+    avail = avail ? std::min(*avail, left) : left;
+    break;
+  }
+  return avail;
+}
+
+// Picks how many files to convert at once: one job per two cores, held down
+// to what 60% of the available memory fits at opt.batch_rows, and never more
+// than `files`. Falls back to one job when the memory is unknown.
+unsigned auto_jobs(const options& opt, std::size_t files) {
+  unsigned cores = std::thread::hardware_concurrency();
+  if (cores == 0) cores = 2;
+  std::uint64_t jobs = std::max(1u, cores / 2);
+  const auto memory = available_memory();
+  if (!memory) {
+    jobs = 1;
+  } else {
+    const std::uint64_t by_memory = *memory / 10 * 6 / ParquetWriter::peak_memory(opt.batch_rows);
+    jobs = std::min(jobs, std::max<std::uint64_t>(1, by_memory));
+  }
+  return static_cast<unsigned>(std::min<std::uint64_t>(jobs, files));
+}
 
 }  // namespace
 
@@ -277,7 +343,9 @@ int convert_tree(const options& opt) {
     }
   };
 
-  const unsigned jobs = std::max(1u, std::min<unsigned>(opt.jobs, files.size()));
+  const unsigned jobs = opt.jobs != 0 ? std::max(1u, std::min<unsigned>(opt.jobs, files.size()))
+                                      : auto_jobs(opt, files.size());
+  if (opt.jobs == 0) fmt::print("{} files, {} at a time\n", files.size(), jobs);
   std::vector<std::thread> threads;
   for (unsigned i = 1; i < jobs; ++i) threads.emplace_back(worker);
   worker();

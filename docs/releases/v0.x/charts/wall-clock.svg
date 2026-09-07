@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 300" width="720" height="300" role="img" aria-label="Wall-clock time per workload, v0.1.0 versus v0.2.0, in seconds"><title>Wall-clock time per workload, v0.1.0 versus v0.2.0, in seconds</title>
+<style>
+  :root { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7;
+          --s1:#2a78d6; --s1-light:#86b6ef; --s2:#eb6834; --s3:#1baf7a; --dim:#d6d5cf; }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781; --grid:#2c2c2a; --axis:#383835;
+            --s1:#3987e5; --s1-light:#1c5cab; --s2:#d95926; --s3:#199e70; --dim:#3a3a38; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+  .surface { fill: var(--surface); }
+  .title { font-size: 15px; font-weight: 600; }
+  .sub, .legend { font-size: 12px; fill: var(--ink2); }
+  .tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .cat { font-size: 12px; fill: var(--ink2); }
+  .val { font-size: 12px; fill: var(--ink); font-variant-numeric: tabular-nums; }
+  .val-in { font-size: 12px; fill: #ffffff; font-variant-numeric: tabular-nums; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+  .conn { stroke: var(--axis); stroke-width: 2; stroke-linecap: round; }
+  .ring { stroke: var(--surface); stroke-width: 2; }
+  .s1 { fill: var(--s1); } .s1l { fill: var(--s1-light); } .s2 { fill: var(--s2); } .s3 { fill: var(--s3); } .dim { fill: var(--dim); }
+</style>
+<rect class="surface" width="720" height="300" rx="6"/><text class="title" x="24" y="30">Wall-clock time per workload, v0.1.0 to v0.2.0</text><text class="sub" x="24" y="49">Seconds, lower is better. 8 vCPUs, 7.7 GB, Apple M4 Pro; five files = 4.4 GB compressed.</text><circle class="s1l" cx="480" cy="30" r="5"/><text class="legend" x="490" y="34">v0.1.0</text><circle class="s1" cx="550" cy="30" r="5"/><text class="legend" x="560" y="34">v0.2.0</text><line class="axis" x1="210.0" y1="70" x2="210.0" y2="254"/><text class="tick" x="210.0" y="270" text-anchor="middle">0</text><line class="grid" x1="300.0" y1="70" x2="300.0" y2="254"/><text class="tick" x="300.0" y="270" text-anchor="middle">10</text><line class="grid" x1="390.0" y1="70" x2="390.0" y2="254"/><text class="tick" x="390.0" y="270" text-anchor="middle">20</text><line class="grid" x1="480.0" y1="70" x2="480.0" y2="254"/><text class="tick" x="480.0" y="270" text-anchor="middle">30</text><line class="grid" x1="570.0" y1="70" x2="570.0" y2="254"/><text class="tick" x="570.0" y="270" text-anchor="middle">40</text><line class="grid" x1="660.0" y1="70" x2="660.0" y2="254"/><text class="tick" x="660.0" y="270" text-anchor="middle">50</text><text class="tick" x="660.0" y="284" text-anchor="end">seconds</text><text class="cat" x="198" y="97.0" text-anchor="end">One file, 47.5M records</text><line class="conn" x1="238.8" y1="93.0" x2="285.6" y2="93.0"/><circle class="s1l ring" cx="285.6" cy="93.0" r="6"/><circle class="s1 ring" cx="238.8" cy="93.0" r="6"/><text class="val" x="285.6" y="82.0" text-anchor="middle">8.4 s</text><text class="val" x="238.8" y="82.0" text-anchor="middle">3.2 s</text><text class="cat" x="198" y="143.0" text-anchor="end">Five files, --jobs 1</text><line class="conn" x1="399.0" y1="139.0" x2="631.2" y2="139.0"/><circle class="s1l ring" cx="631.2" cy="139.0" r="6"/><circle class="s1 ring" cx="399.0" cy="139.0" r="6"/><text class="val" x="631.2" y="128.0" text-anchor="middle">46.8 s</text><text class="val" x="399.0" y="128.0" text-anchor="middle">21.0 s</text><text class="cat" x="198" y="189.0" text-anchor="end">Five files, --jobs 5</text><line class="conn" x1="291.9" y1="185.0" x2="352.2" y2="185.0"/><circle class="s1l ring" cx="352.2" cy="185.0" r="6"/><circle class="s1 ring" cx="291.9" cy="185.0" r="6"/><text class="val" x="352.2" y="174.0" text-anchor="middle">15.8 s</text><text class="val" x="291.9" y="174.0" text-anchor="middle">9.1 s</text><text class="cat" x="198" y="235.0" text-anchor="end">Five files, default arguments</text><line class="conn" x1="313.5" y1="231.0" x2="631.2" y2="231.0"/><circle class="s1l ring" cx="631.2" cy="231.0" r="6"/><circle class="s1 ring" cx="313.5" cy="231.0" r="6"/><text class="val" x="631.2" y="220.0" text-anchor="middle">46.8 s</text><text class="val" x="313.5" y="220.0" text-anchor="middle">11.5 s</text></svg>
