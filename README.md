@@ -86,6 +86,16 @@ The Parquet key-value metadata holds the DBN header: `dbn.version`,
 Encoding: zstd compression, one row group per `--batch-rows`, timestamps and
 `sequence` delta-packed, everything else dictionary-encoded.
 
+## Release notes
+
+One note per release under `docs/releases/`, grouped by minor series. Each
+note lists the output-schema changes, the measured performance, and the
+upgrade steps.
+
+| Version | Date | Highlights |
+|---|---|---|
+| [v0.2.0](docs/releases/v0.x/v0.2.0.md) | 2026-09-07 | Iceberg primitive types in the output, 2.6× faster conversion, `--jobs` sized from cores and memory |
+
 ## Layout
 
 ```
@@ -95,6 +105,7 @@ include/ParquetWriter.h   Arrow batch builders and the threaded Parquet writer
 third_party/nlib/         git submodule: nlib (single_queue feeds the writer thread)
 third_party/CLI11/        git submodule: CLI11, header-only command-line parser
 src/main.cpp              CLI11 subcommands, each calling an internal interface
+docs/releases/<series>/   release notes with their SVG charts
 data/                     gitignored: input/, output/, backplay/
 ```
 
