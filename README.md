@@ -1,7 +1,7 @@
 <img src="https://capsule-render.vercel.app/api?type=waving&height=400&text=N-Player&fontAlign=80&fontAlignY=40&color=gradient" />
 
 <p align="center">
-  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue" />
+  <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-blue" />
   <img alt="C++23" src="https://img.shields.io/badge/C%2B%2B-23-00599C?logo=cplusplus&logoColor=white" />
   <img alt="CMake 3.28+" src="https://img.shields.io/badge/CMake-3.28%2B-064F8C?logo=cmake&logoColor=white" />
   <img alt="Apache Arrow / Parquet" src="https://img.shields.io/badge/Apache-Arrow%20%2F%20Parquet-1F6FEB" />
@@ -55,7 +55,7 @@ The command line is parsed by [CLI11](https://github.com/CLIUtils/CLI11)
 -o, --output DIR      directory written to (default: data/output)
 -l, --limit N         convert only the first N records of each file
 -b, --batch-rows N    rows per Parquet row group (default: 1048576)
--j, --jobs N          files converted at the same time (default: 1)
+-j, --jobs N          files converted at the same time (default: 0, sized from CPU cores and available memory)
 ```
 
 Each file is written to `<name>.parquet.tmp` and renamed on success, so an
@@ -65,9 +65,12 @@ reported on stderr and skipped; the exit code is 1 if any file failed.
 ## Output
 
 One row per DBN record, in file order, columns in Databento's DataFrame
-order. Prices stay fixed point (`int64`, 1e-9 of the quote unit); timestamps
-are `timestamp[ns, UTC]`. Undefined sentinels (price `INT64_MAX`, size
-`UINT32_MAX`, timestamp `UINT64_MAX`) become nulls.
+order. Every column uses an Iceberg primitive type: `int32`, `int64`, or
+`string`. Timestamps are `int64` Unix-epoch nanoseconds; a reader casts them
+to a timestamp type. Prices stay fixed point (`int64`, 1e-9 of the quote
+unit). Undefined sentinels (price `INT64_MAX`, size `UINT32_MAX`, timestamp
+`UINT64_MAX`) become nulls. An `order_id` at or above 2^63 comes out
+negative; a cast to unsigned restores it.
 
 | Schema | rtype | Columns |
 |---|---|---|
@@ -88,13 +91,12 @@ Encoding: zstd compression, one row group per `--batch-rows`, timestamps and
 
 ## Release notes
 
-One note per release under `docs/releases/`, grouped by minor series. Each
-note lists the output-schema changes, the measured performance, and the
-upgrade steps.
+One folder per release under `docs/releases/`. Each note lists the
+output-schema changes, the measured performance, and the upgrade steps.
 
 | Version | Date | Highlights |
 |---|---|---|
-| [v0.2.0](docs/releases/v0.x/v0.2.0.md) | 2026-09-07 | Iceberg primitive types in the output, 2.6× faster conversion, `--jobs` sized from cores and memory |
+| [v0.2.0](docs/releases/v0.2.0/v0.2.0.md) | 2026-09-07 | Iceberg primitive types in the output, 2.6× faster conversion, `--jobs` sized from cores and memory |
 
 ## Layout
 
@@ -105,7 +107,7 @@ include/ParquetWriter.h   Arrow batch builders and the threaded Parquet writer
 third_party/nlib/         git submodule: nlib (single_queue feeds the writer thread)
 third_party/CLI11/        git submodule: CLI11, header-only command-line parser
 src/main.cpp              CLI11 subcommands, each calling an internal interface
-docs/releases/<series>/   release notes with their SVG charts
+docs/releases/<version>/  release notes with their SVG charts
 data/                     gitignored: input/, output/, backplay/
 ```
 
