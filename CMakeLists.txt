@@ -27,7 +27,7 @@ pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
 
 add_executable(nplayer
     src/main.cpp
-    src/Parser.cpp
+    src/DbnParser.cpp
     src/ParquetWriter.cpp
 )
 target_include_directories(nplayer PRIVATE include)

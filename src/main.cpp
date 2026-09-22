@@ -9,7 +9,7 @@
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
-#include "Parser.h"
+#include "DbnParser.h"
 #include "common.h"
 
 namespace {

@@ -19,14 +19,14 @@ namespace nplayer {
 // Streaming decoder of one zstd-compressed DBN file. Decompresses in chunks
 // and yields records one at a time, so memory stays near one zstd window
 // whatever the file size. Throws std::runtime_error on any malformed input.
-class Parser {
+class DbnParser {
  public:
   // Opens `file` and decodes its metadata header.
-  explicit Parser(const std::filesystem::path& file);
-  ~Parser();
+  explicit DbnParser(const std::filesystem::path& file);
+  ~DbnParser();
 
-  Parser(const Parser&) = delete;
-  Parser& operator=(const Parser&) = delete;
+  DbnParser(const DbnParser&) = delete;
+  DbnParser& operator=(const DbnParser&) = delete;
 
   const dbn::metadata& metadata() const { return metadata_; }
 

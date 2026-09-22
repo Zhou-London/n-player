@@ -1,4 +1,4 @@
-#include "Parser.h"
+#include "DbnParser.h"
 
 #include <algorithm>
 #include <atomic>
@@ -122,9 +122,9 @@ unsigned auto_jobs(const options& opt, std::size_t files) {
 
 }  // namespace
 
-// Parser
+// DbnParser
 
-Parser::Parser(const std::filesystem::path& file) : path_(file) {
+DbnParser::DbnParser(const std::filesystem::path& file) : path_(file) {
   file_ = std::fopen(file.c_str(), "rb");
   if (file_ == nullptr) fail(fmt::format("cannot open: {}", std::strerror(errno)));
   dstream_ = ZSTD_createDStream();
@@ -136,16 +136,16 @@ Parser::Parser(const std::filesystem::path& file) : path_(file) {
   read_metadata();
 }
 
-Parser::~Parser() {
+DbnParser::~DbnParser() {
   ZSTD_freeDStream(dstream_);
   if (file_ != nullptr) std::fclose(file_);
 }
 
-void Parser::fail(const std::string& what) const {
+void DbnParser::fail(const std::string& what) const {
   throw std::runtime_error(fmt::format("{}: {}", path_.string(), what));
 }
 
-bool Parser::fill() {
+bool DbnParser::fill() {
   while (true) {
     if (in_buf_.pos == in_buf_.size) {
       const std::size_t n = std::fread(in_.data(), 1, in_.size(), file_);
@@ -167,7 +167,7 @@ bool Parser::fill() {
   }
 }
 
-void Parser::read_metadata() {
+void DbnParser::read_metadata() {
   while (buf_.size() < dbn::prelude_len) {
     if (!fill()) fail("file shorter than the DBN prelude");
   }
@@ -239,7 +239,7 @@ void Parser::read_metadata() {
   pos_ = dbn::prelude_len + length;
 }
 
-std::uint64_t Parser::for_each_record(
+std::uint64_t DbnParser::for_each_record(
     const std::function<void(std::span<const std::byte>)>& fn, std::uint64_t limit) {
   std::uint64_t count = 0;
   while (true) {
@@ -274,7 +274,7 @@ void cursor::need(std::size_t n) const {
 convert_result convert_file(const std::filesystem::path& in, const std::filesystem::path& out,
                             const options& opt) {
   const auto t0 = std::chrono::steady_clock::now();
-  Parser parser(in);
+  DbnParser parser(in);
   const dbn::metadata& md = parser.metadata();
   if (!md.schema) {
     throw std::runtime_error(fmt::format("{}: file mixes schemas, which Parquet cannot hold",

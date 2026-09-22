@@ -102,7 +102,7 @@ output-schema changes, the measured performance, and the upgrade steps.
 
 ```
 include/common.h          DBN wire layout (header, mbo, trades records), metadata, options
-include/Parser.h          streaming zstd + DBN decoder; convert_file / convert_tree
+include/DbnParser.h       streaming zstd + DBN decoder; convert_file / convert_tree
 include/ParquetWriter.h   Arrow batch builders and the threaded Parquet writer
 third_party/nlib/         git submodule: nlib (single_queue feeds the writer thread)
 third_party/CLI11/        git submodule: CLI11, header-only command-line parser
