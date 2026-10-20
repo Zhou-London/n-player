@@ -1,4 +1,4 @@
-<img src="https://capsule-render.vercel.app/api?type=waving&height=400&text=N-Player&fontAlign=80&fontAlignY=40&color=gradient" />
+<p align="center"><img src="https://capsule-render.vercel.app/api?type=soft&height=220&color=gradient&text=N-Player&fontSize=64&fontAlign=50&fontAlignY=42" /></p>
 
 <p align="center">
   <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-blue" />
