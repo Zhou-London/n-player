@@ -62,6 +62,33 @@ Each file is written to `<name>.parquet.tmp` and renamed on success, so an
 existing `.parquet` is either complete or absent. A file that fails is
 reported on stderr and skipped; the exit code is 1 if any file failed.
 
+### `backplay`
+
+```
+-H, --host HOST       sender to connect to; with --listen, the address to bind (default: 127.0.0.1)
+-p, --port N          TCP port (default: 40005)
+-l, --listen          listen on host:port and wait for the sender to connect
+-q, --queue-depth N   record batches buffered between the socket reader and the player (default: 16)
+```
+
+Connects to the sender and reads one Arrow IPC stream from the connection.
+With `--listen` it binds host:port instead and accepts one connection. The
+stream ends at the IPC end-of-stream marker or when the sender closes at a
+message boundary; a close inside a message is an error. The command prints
+the batch and row counts and the stream's schema, then exits. The player
+thread drops every batch for now; encoding into `nlib` records and
+publishing over ZMQ come next.
+
+From the container, a sender on the host is `host.docker.internal`:
+
+```bash
+make run ARGS="backplay --host host.docker.internal"
+```
+
+`make run` also publishes `PORT` (default 40005) from the container, so
+`make run ARGS="backplay --listen --host 0.0.0.0"` accepts a sender on the
+host at `localhost:40005`.
+
 ## Output
 
 One row per DBN record, in file order, columns in Databento's DataFrame
@@ -104,11 +131,12 @@ output-schema changes, the measured performance, and the upgrade steps.
 include/common.h          DBN wire layout (header, mbo, trades records), metadata, options
 include/DbnParser.h       streaming zstd + DBN decoder; convert_file / convert_tree
 include/ParquetWriter.h   Arrow batch builders and the threaded Parquet writer
+include/Backplayer.h      Arrow IPC stream receiver over TCP, feeding the player thread
 third_party/nlib/         git submodule: nlib (single_queue feeds the writer thread)
 third_party/CLI11/        git submodule: CLI11, header-only command-line parser
 src/main.cpp              CLI11 subcommands, each calling an internal interface
 docs/releases/<version>/  release notes with their SVG charts
-data/                     gitignored: input/, output/, backplay/
+data/                     gitignored: input/, output/
 ```
 
 Decoding and Parquet encoding run on two threads joined by an

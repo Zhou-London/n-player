@@ -251,6 +251,14 @@ struct options {
   unsigned jobs = 0;               // files converted at the same time; 0 picks from cores and memory
 };
 
+// Settings of one backplay run, as parsed from the command line.
+struct backplay_options {
+  std::string host = "127.0.0.1";  // sender to connect to, or the address to listen on
+  std::uint16_t port = 40005;
+  bool listen = false;  // wait for the sender to connect instead of connecting to it
+  std::size_t queue_depth = 16;  // record batches buffered between the socket and the player
+};
+
 // Outcome of converting one file.
 struct convert_result {
   std::uint64_t records = 0;  // records decoded

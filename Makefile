@@ -10,9 +10,11 @@ build:
 
 # Runs a subcommand; ARGS defaults to converting data/input to data/output.
 # Example: make run ARGS="convert --limit 1000000 --jobs 2".
+# PORT is published from the container for `backplay --listen`; convert ignores it.
 ARGS ?= convert
+PORT ?= 40005
 run: build
-	$(DOCKER_RUN) ./build/nplayer $(ARGS)
+	docker run --rm -p $(PORT):$(PORT) -v "$(CURDIR):/work" -w /work $(IMAGE) ./build/nplayer $(ARGS)
 
 shell:
 	docker run --rm -it -v "$(CURDIR):/work" -w /work $(IMAGE)

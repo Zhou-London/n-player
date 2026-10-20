@@ -29,6 +29,7 @@ add_executable(nplayer
     src/main.cpp
     src/DbnParser.cpp
     src/ParquetWriter.cpp
+    src/Backplayer.cpp
 )
 target_include_directories(nplayer PRIVATE include)
 target_link_libraries(nplayer PRIVATE

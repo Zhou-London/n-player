@@ -9,6 +9,7 @@
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
+#include "Backplayer.h"
 #include "DbnParser.h"
 #include "common.h"
 
@@ -40,6 +41,32 @@ void add_convert(CLI::App& app, nplayer::options& opt, int& rc) {
   cmd->callback([&] { rc = nplayer::convert_tree(opt) == 0 ? 0 : 1; });
 }
 
+// Registers `backplay`: connects to a sender (or listens for one), receives
+// one Arrow IPC stream over TCP, and reports what arrived.
+void add_backplay(CLI::App& app, nplayer::backplay_options& opt, int& rc) {
+  CLI::App* cmd = app.add_subcommand(
+      "backplay",
+      "Connect to the sender over TCP, receive one Arrow IPC stream, and play it back. "
+      "The command returns when the sender ends the stream.");
+  cmd->add_option("-H,--host", opt.host, "Sender to connect to; with --listen, the address to bind")
+      ->capture_default_str();
+  cmd->add_option("-p,--port", opt.port, "TCP port")->type_name("N")->capture_default_str();
+  cmd->add_flag("-l,--listen", opt.listen, "Listen on host:port and wait for the sender to connect");
+  cmd->add_option("-q,--queue-depth", opt.queue_depth,
+                  "Record batches buffered between the socket reader and the player")
+      ->type_name("N")
+      ->capture_default_str()
+      ->check(CLI::Range(std::size_t{1}, std::numeric_limits<std::size_t>::max()));
+  cmd->callback([&] {
+    nplayer::Backplayer player(opt);
+    fmt::print("{} {}:{}\n", opt.listen ? "listening on" : "connecting to", opt.host, opt.port);
+    const nplayer::backplay_result r = player.run();
+    fmt::print("received {} batches, {} rows in {:.3f} s\n", r.batches, r.rows, r.seconds);
+    if (r.schema) fmt::print("schema:\n{}\n", r.schema->ToString());
+    rc = 0;
+  });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -49,6 +76,8 @@ int main(int argc, char** argv) {
   nplayer::options opt;
   int rc = 0;
   add_convert(app, opt, rc);
+  nplayer::backplay_options backplay_opt;
+  add_backplay(app, backplay_opt, rc);
 
   try {
     app.parse(argc, argv);
